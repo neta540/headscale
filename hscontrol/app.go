@@ -492,7 +492,7 @@ func (h *Headscale) Serve() error {
 
 	if h.cfg.DERP.ServerEnabled {
 		// When embedded DERP is enabled we always need a STUN server
-		if h.cfg.DERP.STUNAddr == "" {
+		if h.cfg.DERP.STUNConfig.Address == "" {
 			return errSTUNAddressNotSet
 		}
 

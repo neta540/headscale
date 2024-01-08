@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"net/netip"
 	"net/url"
 	"os"
@@ -106,13 +107,24 @@ type OIDCConfig struct {
 	UseExpiryFromToken         bool
 }
 
+type STUNRule struct {
+	Match   *net.IPNet
+	Address netip.Addr
+	Port    string
+}
+
+type STUNConfig struct {
+	Address string
+	Rules   []STUNRule
+}
+
 type DERPConfig struct {
 	ServerEnabled        bool
 	ServerRegionID       int
 	ServerRegionCode     string
 	ServerRegionName     string
 	ServerPrivateKeyPath string
-	STUNAddr             string
+	STUNConfig           STUNConfig
 	URLs                 []url.URL
 	Paths                []string
 	AutoUpdate           bool
@@ -280,12 +292,94 @@ func GetTLSConfig() TLSConfig {
 	}
 }
 
+func convertCIDRtoIPv6(network string) (*net.IPNet, error) {
+	ip, ipNet, err := net.ParseCIDR(network)
+	if err != nil || ip.To4() == nil {
+		return ipNet, err
+	}
+
+	maskSize, _ := ipNet.Mask.Size()
+	return &net.IPNet{
+		IP:   net.ParseIP("::ffff:" + ip.String()),
+		Mask: net.CIDRMask(maskSize+96, 128),
+	}, nil
+}
+
 func GetDERPConfig() DERPConfig {
 	serverEnabled := viper.GetBool("derp.server.enabled")
 	serverRegionID := viper.GetInt("derp.server.region_id")
 	serverRegionCode := viper.GetString("derp.server.region_code")
 	serverRegionName := viper.GetString("derp.server.region_name")
-	stunAddr := viper.GetString("derp.server.stun_listen_addr")
+	stunAddr := viper.GetString("derp.server.stun.listen_addr")
+	if stunAddr == "" {
+		stunAddr = viper.GetString("derp.server.stun_listen_addr")
+	}
+
+	// load STUN rules from config
+	type STUNRuleConf struct {
+		Match   string
+		Address string
+		Port    string
+	}
+
+	var stunRulesConfig []STUNRuleConf
+	if err := viper.UnmarshalKey("derp.server.stun.rules", &stunRulesConfig); err != nil {
+		log.Error().Err(err).Msg("Failed to parse STUN rules")
+	}
+
+	stunRules := make([]STUNRule, 0)
+	var ruleErrorText string
+
+	for _, rule := range stunRulesConfig {
+		var ruleAddr netip.Addr
+		var err error
+
+		var rulePort string
+		addrPort, err := netip.ParseAddrPort(rule.Address)
+		if err != nil {
+			ruleAddr, err = netip.ParseAddr(rule.Address)
+			if err != nil {
+				ruleErrorText += fmt.Sprintf("STUN config error: could not parse STUN rule \"address\" %s\n", rule.Address)
+				continue
+			}
+		} else {
+			rulePort = fmt.Sprint(addrPort.Port())
+			ruleAddr = addrPort.Addr()
+		}
+
+		if rule.Match == "any" || rule.Match == "*" {
+			matchIpv4, _ := convertCIDRtoIPv6("0.0.0.0/0")
+			matchIpv6, _ := convertCIDRtoIPv6("::/0")
+			stunRules = append(stunRules, STUNRule{
+				Match:   matchIpv4,
+				Address: ruleAddr,
+				Port:    rulePort,
+			})
+			stunRules = append(stunRules, STUNRule{
+				Match:   matchIpv6,
+				Address: ruleAddr,
+				Port:    rulePort,
+			})
+			continue
+		}
+
+		cidr, err := convertCIDRtoIPv6(rule.Match)
+		if err != nil {
+			ruleErrorText += fmt.Sprintf("STUN config error: could not parse STUN rule \"match\" %s\n", rule.Match)
+			continue
+		}
+
+		stunRules = append(stunRules, STUNRule{
+			Match:   cidr,
+			Address: ruleAddr,
+			Port:    rulePort,
+		})
+	}
+
+	if ruleErrorText != "" {
+		log.Error().Msg(strings.TrimSuffix(ruleErrorText, "\n"))
+	}
+
 	privateKeyPath := util.AbsolutePathFromConfigPath(viper.GetString("derp.server.private_key_path"))
 
 	if serverEnabled && stunAddr == "" {
@@ -319,11 +413,13 @@ func GetDERPConfig() DERPConfig {
 		ServerRegionCode:     serverRegionCode,
 		ServerRegionName:     serverRegionName,
 		ServerPrivateKeyPath: privateKeyPath,
-		STUNAddr:             stunAddr,
-		URLs:                 urls,
-		Paths:                paths,
-		AutoUpdate:           autoUpdate,
-		UpdateFrequency:      updateFrequency,
+		STUNConfig: STUNConfig{
+			Address: stunAddr,
+			Rules:   stunRules},
+		URLs:            urls,
+		Paths:           paths,
+		AutoUpdate:      autoUpdate,
+		UpdateFrequency: updateFrequency,
 	}
 }
 

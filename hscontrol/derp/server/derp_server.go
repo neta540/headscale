@@ -88,7 +88,7 @@ func (d *DERPServer) GenerateRegion() (tailcfg.DERPRegion, error) {
 		},
 	}
 
-	_, portSTUNStr, err := net.SplitHostPort(d.cfg.STUNAddr)
+	_, portSTUNStr, err := net.SplitHostPort(d.cfg.STUNConfig.Address)
 	if err != nil {
 		return tailcfg.DERPRegion{}, err
 	}
@@ -248,7 +248,7 @@ func DERPBootstrapDNSHandler(
 
 // ServeSTUN starts a STUN server on the configured addr.
 func (d *DERPServer) ServeSTUN() {
-	packetConn, err := net.ListenPacket("udp", d.cfg.STUNAddr)
+	packetConn, err := net.ListenPacket("udp", d.cfg.STUNConfig.Address)
 	if err != nil {
 		log.Fatal().Msgf("failed to open STUN listener: %v", err)
 	}
@@ -258,10 +258,10 @@ func (d *DERPServer) ServeSTUN() {
 	if !ok {
 		log.Fatal().Msg("STUN listener is not a UDP listener")
 	}
-	serverSTUNListener(context.Background(), udpConn)
+	serverSTUNListener(context.Background(), udpConn, &d.cfg.STUNConfig)
 }
 
-func serverSTUNListener(ctx context.Context, packetConn *net.UDPConn) {
+func serverSTUNListener(ctx context.Context, packetConn *net.UDPConn, cfg *types.STUNConfig) {
 	var buf [64 << 10]byte
 	var (
 		bytesRead int
@@ -294,7 +294,20 @@ func serverSTUNListener(ctx context.Context, packetConn *net.UDPConn) {
 		}
 
 		addr, _ := netip.AddrFromSlice(udpAddr.IP)
-		res := stun.Response(txid, netip.AddrPortFrom(addr, uint16(udpAddr.Port)))
+		var addrPort = netip.AddrPortFrom(addr, uint16(udpAddr.Port))
+		for _, rule := range cfg.Rules {
+			if rule.Match.Contains(udpAddr.IP) {
+				if rule.Port == "" {
+					addrPort = netip.AddrPortFrom(rule.Address, uint16(udpAddr.Port))
+				} else {
+					val, _ := strconv.ParseUint(rule.Port, 10, 16)
+					addrPort = netip.AddrPortFrom(rule.Address, uint16(val))
+				}
+				break
+			}
+		}
+
+		res := stun.Response(txid, addrPort)
 		_, err = packetConn.WriteTo(res, udpAddr)
 		if err != nil {
 			log.Trace().Caller().Err(err).Msgf("Issue writing to UDP")
